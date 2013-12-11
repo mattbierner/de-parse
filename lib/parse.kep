@@ -8,6 +8,8 @@ package (
     tail,
     trampoline,
     
+    appk,
+    
 // Errors
     ParserError,
     
@@ -96,7 +98,7 @@ package (
     testStream,
     test)
 with
-    import 'nu/stream' stream{'end': NIL, first, isEmpty, rest, foldl, reduceRight, foldr},
+    import 'nu/stream' stream{NIL, first, isEmpty, rest, foldl, reduceRight, foldr},
     import 'seshat' seshat
 in {
 
@@ -114,18 +116,19 @@ var flip = \f -> \x, y -> f(y, x);
 
 var uniqueParserId = Math.random;
 
-/* Continuation
+/* Tail Call Continuation
  ******************************************************************************/
-tail = \f, args -> {
-    var c = [f, args];
-    c._next = true;
-    return c;
+var Tail = function(f, args) {
+    this.f = f;
+    this.args = args;
 };
+
+tail = \f, args -> new Tail(f, args);
 
 trampoline = \f -> {
     var value = f;
-    while (value && value._next)
-        value = value[0].apply(undefined, value[1]);
+    while (value instanceof Tail)
+        value = value.f.apply(null, value.args);
     return value;
 };
 
@@ -184,10 +187,13 @@ Memoer.lookup = \m, pos, id ->
  * Update the memoization table to store `val` for result at `pos` from parser
  * `id`.
  */
-Memoer.update = \m, pos, id, val ->
-    new Memoer(
+Memoer.update = \m, pos, id, val -> {
+    static console;
+    console.log(pos, id);
+    return new Memoer(
         seshat.update(m.memoer, pos, id, val),
         m.frames);
+};
 
 /* Records
  ******************************************************************************/
@@ -275,7 +281,7 @@ ParserState.prototype.next = \x -> {
             rest(this.input),
             this.position.increment(x),
             this.userState);
-        this._next = \_, m, cok -> cok(x, s, m);
+        this._next = \_, m, cok -> appk(cok, x, s, m);
     }
     return this._next;
 };
@@ -459,6 +465,109 @@ Object.defineProperty(ExpectError.prototype, 'errorMessage', {
             "")
 });
 
+/* Appk
+ ******************************************************************************/
+var K = function(){};
+
+var BindCok = function(f, cok, cerr, eok, eerr) {
+    this.f = f; this.cok = cok; this.cerr = cerr; this.eok = eok; this.eerr = eerr;
+};
+BindCok.prototype = new K;
+BindCok.prototype.type = 'bindCok';
+
+var BindEok = function(f, cok, cerr, eok, eerr) {
+    this.f = f; this.cok = cok; this.cerr = cerr; this.eok = eok; this.eerr = eerr;
+};
+BindEok.prototype = new K;
+BindEok.prototype.type = 'bindEok';
+
+var Attempt = function(k) {
+    this.k = k;
+};
+Attempt.prototype = new K;
+Attempt.prototype.type = 'attempt';
+
+var Expected = function(k, expected) {
+    this.k = k;
+    this.expected = expected;
+};
+Expected.prototype = new K;
+Expected.prototype.type = 'expected';
+
+
+var MemoCok = function(k, position, key) {
+    this.k = k; this.position = position; this.key = key;
+};
+MemoCok.prototype = new K;
+MemoCok.prototype.type = 'memoCok';
+
+var MemoCerr = function(k, position, key) {
+    this.k = k; this.position = position; this.key = key;
+};
+MemoCerr.prototype = new K;
+MemoCerr.prototype.type = 'memoCerr';
+
+var MemoEok = function(k, position, key) {
+    this.k = k; this.position = position; this.key = key;
+};
+MemoEok.prototype = new K;
+MemoEok.prototype.type = 'memoEok';
+
+var MemoEerr = function(k, position, key) {
+    this.k = k; this.position = position; this.key = key;
+};
+MemoEerr.prototype = new K;
+MemoEerr.prototype.type = 'memoEerr';
+
+var EitherP = function(q, e, state, cok, cerr, eok, eerr) {
+    this.q = q; this.e = e; this.state = state; this.cok = cok; this.cerr = cerr; this.eok = eok; this.eerr = eerr;
+};
+EitherP.prototype = new K;
+EitherP.prototype.type = 'eitherP';
+
+var EitherQ = function(x, e, state, cok, cerr, eok, eerr) {
+    this.x = x; this.e = e; this.state = state; this.cok = cok; this.cerr = cerr; this.eok = eok; this.eerr = eerr;
+};
+EitherQ.prototype = new K;
+EitherQ.prototype.type = 'eitherQ';
+
+appk = \k, x, state, m -> {
+    var value = k;
+    if (value instanceof K) {
+        switch (value.type) {
+        case 'bindCok': return value.f(x, state, m)(state, m, value.cok, value.cerr, value.cok, value.cerr);
+        
+        case 'bindEok': return value.f(x, state, m)(state, m, value.cok, value.cerr, value.eok, value.eerr);
+        
+        case 'attempt': return appk(value.k, x, state, Memoer.popWindow(m));
+        
+        case 'expected': return appk(value.k, new ExpectError(state.position, value.expected), state, m);
+        
+        case 'eitherP':
+            return new Tail(value.q, [value.state, m,
+                value.cok,
+                value.cerr,
+                value.eok,
+                new EitherQ(x, value.e, value.state, value.cok, value.cerr, value.eok, value.eerr)]);
+        
+        case 'eitherQ': 
+            return appk(value.eerr, value.e(value.cok, value.x, x), value.state, m);
+        
+        case 'memoCok': return appk(value.k, x, state,
+            Memoer.update(m, value.position, value.key, \_, m, cok, _, _, _ -> appk(cok, x, state, m)));
+        
+        case 'memoCerr': return appk(value.k, x, state,
+            Memoer.update(m, value.position, value.key, \_, m, _, cerr, _, _ -> appk(cerr, x, state, m)));
+        
+        case 'memoEok': return appk(value.k, x, state,
+            Memoer.update(m, value.position, value.key, \_, m, _, _, eok, _ -> appk(eok, x, state, m)));
+        
+        case 'memoEerr': return appk(value.k, x, state,
+            Memoer.update(m, value.position, value.key, \_, m, _, _, _, eerr -> appk(eerr, x, state, m)));
+        }
+    }
+    return k(x, state, m);
+};
 /* Rec
  ******************************************************************************/
 /**
@@ -531,9 +640,7 @@ RecParser = \name, body -> Parser(name, rec(body));
  * @param x Value to succeed with.
  */
 always = \x ->
-    function ALWAYS_PARSER(state, m, cok, cerr, eok /*, _*/) {
-        return eok(x, state, m);
-    };
+    function ALWAYS_PARSER \state, m, _, _, eok, _ -> appk(eok, x, state, m);
 
 /**
  * Parser that always fails and consumes no input.
@@ -541,9 +648,7 @@ always = \x ->
  * @param x Value to fail with.
  */
 never = \x ->
-    function NEVER_PARSER(state, m, cok, cerr, eok, eerr) {
-        return eerr(x, state, m);
-    };
+    function NEVER_PARSER \state, m, _, _, _, eerr -> appk(eerr, x, state, m);
 
 /**
  * Parser that parses 'p', passing the results to function 'f' which returns a
@@ -553,13 +658,12 @@ never = \x ->
  * @param f Function called with result from 'p' and returns parser 'q'.
  */
 bind = \p, f ->
-    function BIND_PARSER(state, m, cok, cerr, eok, eerr) {
-        return tail(p, [state, m,
-            \x, state, m -> tail(f(x, state, m), [state, m, cok, cerr, cok, cerr]),
+    function BIND_PARSER \state, m, cok, cerr, eok, eerr ->
+        new Tail(p, [state, m,
+            new BindCok(f, cok, cerr, eok, eerr),
             cerr,
-            \x, state, m -> tail(f(x, state, m), [state, m, cok, cerr, eok, eerr]),
+            new BindEok(f, cok, cerr, eok, eerr),
             eerr]);
-    };
 
 // State Interaction Parsers
 ////////////////////////////////////////
@@ -569,9 +673,9 @@ bind = \p, f ->
  *  @param {function(ParserState): *} f Function that transforms that current state.
  */
 modifyParserState = \f ->
-    function MODIFY_PARSER_STATE(state, m, cok, cerr, eok /*, _*/) {
+    function MODIFY_PARSER_STATE \state, m, _, _, eok, _ -> {
         var newState = f(state);
-        return eok(newState, newState, m);
+        return appk(eok, newState, newState, m);
     };
 
 /**
@@ -595,9 +699,7 @@ setParserState = \s ->
  *     given state object.
  */
 extract = \f ->
-    function EXTRACT(state, m, cok, cerr, eok /*, _*/) {
-        return eok(f(state), state, m);
-    };
+    function EXTRACT \state, m, _, _, eok, _ -> appk(eok, f(state), state, m);
 
 /**
  * Parser that modifies the current user state using function 'f'.
@@ -666,32 +768,30 @@ fail = \msg ->
 /**
  * Parser that matches end of input.
  */
-eof = let
+eof = (Parser, 'EOF') <| let
     end = always(NIL)
 in
-    Parser('EOF',
-        bind(getParserState, \s ->
+    bind(getParserState, \s ->
         (s.isEmpty() ?
             end :
-            _fail(\pos -> new ExpectError(pos, "end of input", s.first())))));
+            _fail(\pos -> new ExpectError(pos, "end of input", s.first()))));
 
 /**
  * Parser that attempts parser `p`. Upon failure, never consumes any input.
  */
 attempt = \p ->
-    function ATTEMPT_PARSER(state, m, cok, cerr, eok, eerr) {
-        var peerr = \x, s, m -> eerr(x, s, Memoer.popWindow(m));
-        return tail(p, [state, Memoer.pushWindow(m, state.position),
-            \x, s, m -> cok(x, s, Memoer.popWindow(m)),
+    function ATTEMPT_PARSER \state, m, cok, cerr, eok, eerr -> {
+        var peerr = new Attempt(eerr);
+        return new Tail(p, [state, Memoer.pushWindow(m, state.position),
+            new Attempt(cok),
             peerr,
-            \x, s, m -> eok(x, s, Memoer.popWindow(m)),
+            new Attempt(eok),
             peerr]);
     };
 
 var cnothing = \p ->
-    function LOOK_PARSER(state, m, cok, cerr, eok, eerr) {
-        return tail(p, [state, m, eok, cerr, eok, eerr]);
-    };
+    function LOOK_PARSER \state, m, cok, cerr, eok, eerr ->
+        new Tail(p, [state, m, eok, cerr, eok, eerr]);
 
 /**
  * Run `p`, then restore old state but return result from `p`.
@@ -724,7 +824,7 @@ lookahead = \p ->
 // Combinitorial Parsers
 ////////////////////////////////////////
 /**
- * Parser that parses 'p', then 'q'. Return the 'q' value.
+ * Parse 'p', then 'q'. Return value from 'q'.
  */
 next = \p, q ->
     bind(p, constant(q));
@@ -756,14 +856,12 @@ sequence = args \>> sequencea;
 
 var _either = \e ->
     \p, q ->
-        function EITHER_PARSER(state{position}, m, cok, cerr, eok, eerr) {
-            var peerr = \errFromP, _, mFromP -> {
-                var qeerr = \errFromQ, _, mFromQ ->
-                    eerr(e(position, errFromP, errFromQ), state, mFromQ);
-                return tail(q, [state, mFromP, cok, cerr, eok, qeerr]);
-            };
-            return tail(p, [state, m, cok, cerr, eok, peerr]);
-        };
+        function EITHER_PARSER \state, m, cok, cerr, eok, eerr ->
+            new Tail(p, [state, m,
+                 cok,
+                 cerr,
+                 eok,
+                 new EitherP(q, e, state, cok, cerr, eok, eerr)]);
 
 /**
  * Parser that attempts p or q. If p succeeds, returns its value. Else, tries
@@ -812,13 +910,12 @@ optional = \x, p ->
  * @param p Parser to attempt.
  */
 expected = \expect, p ->
-    function EXPECTED_PARSER(state, m, cok, cerr, eok, eerr) {
-        return p(state, m,
+    function EXPECTED_PARSER \state, m, cok, cerr, eok, eerr ->
+        p(state, m,
             cok,
             cerr,
             eok,
-            \x, state, m -> eerr(new ExpectError(state.position, expect), state, m));
-    };
+            new Expected(eerr, expect));
 
 // Iterative Parsers
 ////////////////////////////////////////
@@ -893,11 +990,11 @@ many = let
     manyError = throwConstant(
         new ParserError("Many parser applied to a parser that accepts an empty string"))
 in
-    function MANY_PARSER(p) {
-        var safeP = \state, m, cok, cerr, eok, eerr ->
-            tail(p, [state, m, cok, cerr, manyError, eerr]);
-        return rec(\self -> _optionalValueParser(cons(safeP, self)));
-    };
+    function MANY_PARSER \p -> let
+        safeP = \state, m, cok, cerr, eok, eerr ->
+            new Tail(p, [state, m, cok, cerr, manyError, eerr])
+        in
+            rec(\self -> _optionalValueParser(cons(safeP, self)));
 
 /**
  * Consume 'p' 1 or more times.
@@ -921,19 +1018,19 @@ token = let
     defaultErr = \pos, tok ->
         new UnexpectError(pos, (tok === null ? "end of input" : tok))
 in
-    \consume, onErr -> {
-        var errorHandler = (onErr || defaultErr);
-        return function TOKEN_PARSER(state{position}, m, cok, cerr, eok, eerr) {
+    \consume, onErr -> let
+        errorHandler = (onErr || defaultErr)
+    in
+        function TOKEN_PARSER \state{position}, m, cok, cerr, eok, eerr -> {
             if (state.isEmpty()) {
-                return eerr(errorHandler(position, null), state, m);
+                return appk(eerr, errorHandler(position, null), state, m);
             } else {
                 var tok = state.first();
                 return (consume(tok) ?
                     state.next(tok)(state, m, cok, cerr, eok, eerr) :
-                    eerr(errorHandler(position, tok), state, m));
+                    appk(eerr, errorHandler(position, tok), state, m));
             }
         };
-    };
 
 /**
  * Parser that consumes any token.
@@ -954,22 +1051,14 @@ in
     \state{position}, m, cok, cerr, eok, eerr -> {
         var key = {'id': id, 'state': state};
         var entry = Memoer.lookup(m, position, key);
-        if (entry)
-            return tail(entry, [state, m, cok, cerr, eok, eerr]);
-        
-        return tail(p, [state, m,
-            \x, pstate, pm ->
-                cok(x, pstate,
-                    Memoer.update(pm, position, key, \(_, m, cok /*, cerr, eok, eerr*/) -> cok(x, pstate, m))),
-            \x, pstate, pm ->
-                cerr(x, pstate,
-                    Memoer.update(pm, position, key, \(_, m, cok, cerr /*, eok, eerr*/) -> cerr(x, pstate, m))),
-            \x, pstate, pm ->
-                eok(x, pstate,
-                    Memoer.update(pm, position, key, \(_, m, cok, cerr, eok /*, eerr*/) -> eok(x, pstate, m))),
-            \x, pstate, pm ->
-                eerr(x, pstate,
-                    Memoer.update(pm, position, key, \(_, m, cok, cerr, eok, eerr) -> eerr(x, pstate, m)))]);
+        if (entry) 
+            return new Tail(entry, [state, m, cok, cerr, eok, eerr]);
+
+        return new Tail(p, [state, m,
+            new MemoCok(cok, position, key),
+            new MemoCerr(cerr, position, key),
+            new MemoEok(eok, position, key),
+            new MemoEerr(eerr, position, key)]);
     };
 
 /* Running

@@ -1,11 +1,11 @@
 {
-  "name": "parse.js",
-  "version": "16.0.2",
-  "description": "Combinatory Parsing Library",
-  "main": "lib/parse.js",
+  "name": "de-parse",
+  "version": "0.0.0",
+  "description": "",
+  "main": "dist/parse.js",
   "repository": {
     "type": "git",
-    "url": "git://github.com/mattbierner/parse.js.git"
+    "url": "git://github.com/mattbierner/de-parse.git"
   },
   "keywords": [
     "parse",
